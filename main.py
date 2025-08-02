@@ -4,16 +4,10 @@ AI-Ассистент для Telegram-бота знакомств
 
 Этот скрипт автоматизирует взаимодействие с Telegram-ботом для знакомств (@leomatchbot),
 используя модель Google Gemini для генерации человекоподобных ответов и ведения диалогов.
-Скрипт работает в двух режимах:
-1.  **Режим "Разведчика":** Автоматически просматривает анкеты в боте,
-    принимая решение лайк/дизлайк на основе наличия и длины описания.
-2.  **Режим "Собеседника":** Ведет персонализированные, реалистичные диалоги
-    с пользователями, которые ответили, с целью получить приглашение на встречу.
 
-Автор: [Твое Имя или Никнейм]
-Версия: 1.0.0 (Публичный релиз)
+Автор: polikhronidi dev
+Версия: 1.1.0 (Публичный релиз)
 """
-
 import asyncio
 import datetime
 import json
@@ -23,7 +17,6 @@ import random
 import re
 from logging.handlers import RotatingFileHandler
 
-# Библиотека для загрузки переменных окружения из .env файла
 from dotenv import load_dotenv
 
 import google.generativeai as genai
@@ -32,11 +25,24 @@ from pyrogram import Client, filters, enums
 from pyrogram.errors import UserDeactivated, AuthKeyUnregistered
 from pyrogram.handlers import MessageHandler, EditedMessageHandler
 
-# Загружаем переменные из .env файла в окружение
 load_dotenv()
 
+# --- НАСТРОЙКА ЛОГИРОВАНИЯ ---
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+if not logger.handlers:
+    formatter = logging.Formatter("%(asctime)s - [%(levelname)s] - %(message)s")
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    file_handler = RotatingFileHandler(
+        "ai_bot_logs.txt", maxBytes=5 * 1024 * 1024, backupCount=2, encoding="utf-8"
+    )
+    file_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
+    logger.addHandler(file_handler)
+
 # --- КОНФИГУРАЦИЯ ---
-# Загружаем ключи из переменных окружения для безопасности
 API_ID = os.getenv("TELEGRAM_API_ID")
 API_HASH = os.getenv("TELEGRAM_API_HASH")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -44,32 +50,22 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 SESSION_NAME = "ai_dating_user"
 BOT_USERNAME = "leomatchbot"
 
-# Настройки поведения
-ACTION_COOLDOWN_SECONDS = 70  # КД после лайка/дизлайка в Дайвинчике
-MAX_HISTORY_LENGTH = 20  # Сколько последних сообщений хранить в истории диалога
-GRACE_PERIOD_SECONDS = 7  # Сколько секунд ждать, пока собеседник допишет "лесенку"
-TYPING_SPEED_CPS = 8  # Средняя скорость печати, символов в секунду
-SESSION_TIMEOUT_MINUTES = 15  # Через сколько минут бездействия сессия диалога считается новой
+ACTION_COOLDOWN_SECONDS = 70
+MAX_HISTORY_LENGTH = 20
+GRACE_PERIOD_SECONDS = 7
+TYPING_SPEED_CPS = 8
+SESSION_TIMEOUT_MINUTES = 15
 
-# --- НАСТРОЙКА ЛОГОВ ---
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-
-if not logger.handlers:
-    formatter = logging.Formatter("%(asctime)s - [%(levelname)s] - %(message)s")
-    # Обработчик для вывода в консоль
-    stream_handler = logging.StreamHandler()
-    stream_handler.setFormatter(formatter)
-    logger.addHandler(stream_handler)
-    # Обработчик для записи в файл (ротация после 5МБ)
-    file_handler = RotatingFileHandler(
-        "ai_bot_logs.txt", maxBytes=5 * 1024 * 1024, backupCount=2, encoding="utf-8"
-    )
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
+REPLY_DELAY_CONFIG = {
+    'active_session': {'min_sec': 15, 'max_sec': 60},
+    'new_session': {
+        'fast': {'chance': 0.60, 'min_sec': 15, 'max_sec': 60},
+        'medium': {'chance': 0.35, 'min_sec': 300, 'max_sec': 900},
+        'long': {'chance': 0.05, 'min_sec': 3600, 'max_sec': 10800}
+    }
+}
 
 # --- "МОЗГИ" AI: СИСТЕМНЫЕ ПРОМПТЫ ---
-# Этот промпт отвечает за генерацию первого сообщения в ответ на анкету
 FIRST_MESSAGE_PROMPT = """
 Твоя роль — уверенный, харизматичный и слегка дерзкий парень. Ты видишь суть за словами и не задаешь глупых вопросов.
 
@@ -100,7 +96,6 @@ FIRST_MESSAGE_PROMPT = """
 Напиши ТОЛЬКО ОДНУ фразу-ответ для этой анкеты, следуя всем правилам. Ничего лишнего.
 """
 
-# Этот промпт отвечает за ведение диалога в личных сообщениях.
 # ЗАПОЛНИТЕ ЭТОТ ПРОМПТ СВОИМИ ДАННЫМИ, ЧТОБЫ СОЗДАТЬ УНИКАЛЬНУЮ ЛИЧНОСТЬ!
 CONVERSATION_SYSTEM_PROMPT = """
 Ты — AI-аватар реального парня. Твоя задача — вести диалог от его имени, основываясь на его личности, фактах и стиле общения. Ты не просто чат-бот, ты — его цифровой двойник.
@@ -158,11 +153,13 @@ ACTIVE_DIALOGUE_TASKS = {}
 LEOMATCH_TASK = None
 WHITELIST_IDS = set()
 
-# Регулярные выражения и константы
 ANKET_PATTERN = re.compile(
     r"^(.+?),\s*(\d+),\s*(.+?)(?:[-–—]\s*(.*))?$", re.DOTALL
 )
-KNOWN_IGNORE_MESSAGES = {"✨🔍", "Лайк отправлен, ждем ответа."}
+KNOWN_SYSTEM_MESSAGES = {
+    "✨🔍", "Лайк отправлен, ждем ответа.", "предлагаю тебе сделку",
+    "Этот временный текст увидят все", "Готово", "Возможно позже", "Пропустить"
+}
 
 # --- ИНИЦИАЛИЗАЦИЯ КЛИЕНТОВ ---
 model = None
@@ -195,17 +192,21 @@ def initialize_ai():
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 def load_json_data(filepath: str, default_data):
-    """Загружает данные из JSON файла, создавая его при отсутствии."""
-    try:
-        if os.path.exists(filepath):
+    """Загружает данные из JSON файла, создавая его при отсутствии или ошибке."""
+    if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+        try:
             with open(filepath, "r", encoding="utf-8") as f:
                 return json.load(f)
-        else:
-            with open(filepath, "w", encoding="utf-8") as f:
-                json.dump(default_data, f)
-            return default_data
-    except (json.JSONDecodeError, IOError) as e:
-        logging.error(f"Ошибка загрузки {filepath}: {e}")
+        except json.JSONDecodeError as e:
+            logging.error(f"Ошибка декодирования JSON в {filepath}: {e}. Файл будет перезаписан.")
+
+    try:
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(default_data, f, ensure_ascii=False, indent=4)
+        logging.info(f"Создан новый файл {filepath} с данными по умолчанию.")
+        return default_data
+    except IOError as e:
+        logging.error(f"Не удалось создать/записать файл {filepath}: {e}")
         return default_data
 
 
@@ -396,6 +397,10 @@ async def process_leomatch_message(client, text: str, is_startup: bool = False):
     global last_seen_anket_text, last_action_time
     logging.info(f'[ДАЙВИНЧИК-ИСПОЛНИТЕЛЬ] Анализ текста: "{text[:120]}"')
 
+    if any(phrase in text for phrase in KNOWN_SYSTEM_MESSAGES):
+        logging.info("[ДАЙВИНЧИК-ИСПОЛНИТЕЛЬ] Обнаружено системное/рекламное сообщение. Игнорирую.")
+        return
+
     if "1. Смотреть анкеты" in text:
         logging.info("[ДАЙВИНЧИК-ИСПОЛНИТЕЛЬ] Главное меню. Нажимаю '1'.")
         await asyncio.sleep(2)
@@ -440,8 +445,8 @@ async def process_leomatch_message(client, text: str, is_startup: bool = False):
             )
         return
 
-    if not is_startup and text.strip() not in KNOWN_IGNORE_MESSAGES:
-        logging.warning("[ДАЙВИНЧИК-ИСПОЛНИТЕЛЬ] Нераспознанный текст.")
+    if not is_startup:
+        logging.warning(f"[ДАЙВИНЧИК-ИСПОЛНИТЕЛЬ] Нераспознанный текст: '{text}'")
 
 
 async def private_chat_handler(client, message):
@@ -470,7 +475,7 @@ async def private_chat_handler(client, message):
 
 async def process_dialogue_task(client, message):
     """Фоновая задача для полного цикла ответа в диалоге."""
-    global conversation_histories, ACTIVE_DIALOGUE_TASKS
+    global conversation_histories, ACTIVE_DIALOGUE_TASKS, REPLY_DELAY_CONFIG
     chat_id = message.chat.id
     user_name = message.from_user.first_name
     try:
@@ -561,10 +566,9 @@ async def main():
             return
 
         logging.info("=" * 50)
-        logging.info("AI-Ассистент Знакомств (v1.0.0 'Автоном') запущен!")
+        logging.info("AI-Ассистент Знакомств (v37.0 'Стабильный Запуск') запущен!")
         logging.info("=" * 50)
 
-        # Регистрация обработчиков
         app.add_handler(
             MessageHandler(
                 leomatch_handler,
@@ -587,7 +591,6 @@ async def main():
         )
         logging.info("[СИСТЕМА] Обработчик для личных диалогов зарегистрирован.")
 
-        # Логика "умного старта"
         logging.info(f"[СИСТЕМА] Анализ последнего сообщения от @{BOT_USERNAME}...")
         history = [
             msg async for msg in app.get_chat_history(bot_peer.user_id, limit=1)
